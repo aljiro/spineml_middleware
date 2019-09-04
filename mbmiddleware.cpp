@@ -1,11 +1,13 @@
 #include "mbmiddleware.h"
 
 // Input channel
-InputChannel::InputChannel():active(true){
+Channel::Channel( int port, char *name ):active(true), stateMachine(this), port(port){
 	init();
+	done = false;
+	this->name = name;
 }
 
-void InputChannel::init(){
+void Channel::init(){
 	int opt = 1; 
 
 	std::cout << "Initializing the socket" << std::endl;
@@ -26,7 +28,7 @@ void InputChannel::init(){
 
     address.sin_family = AF_INET; 
     address.sin_addr.s_addr = INADDR_ANY; 
-    address.sin_port = htons( IN_PORT ); 
+    address.sin_port = htons( port ); 
      
     std::cout << "Binding socket to address" << std::endl;
 
@@ -39,13 +41,12 @@ void InputChannel::init(){
     } 
 }
 
-bool InputChannel::isActive(){
+bool Channel::isActive(){
 	return this->active;
 }
 
-void InputChannel::start(){
+void Channel::start(){
 	int addrlen = sizeof(address); 
-	char buffer[1024] = {0};
 	int valread;
 
 	if (listen(sockfd, 3) < 0) 
@@ -54,31 +55,52 @@ void InputChannel::start(){
         exit(EXIT_FAILURE); 
     } 
 
-    std::cout << "Input channel: waiting for connections"<< std::endl;
+    std::cout << "Channel: waiting for connections on port "<< port << std::endl;
 
     while( isActive() ){
 	    if ((new_socket = accept(sockfd, (struct sockaddr *)&address,  
 	                       (socklen_t*)&addrlen))<0) 
 	    { 
+	    	std::cout << ">>> Error when accepting connections" << std::endl;
 	        perror("accept"); 
 	        exit(EXIT_FAILURE); 
 	    } 
 
-	    std::cout << "New message arrived!"<< std::endl;
+	    done = false;
+	    stateMachine.reset();
 
 	    while( stateMachine.process( new_socket ) != Done )
 	    	usleep(100);
+
+	    close(new_socket);
+    	std::cout << "Done with processing in " << this->name << std::endl;
+	    done = true;
     } 
 }
 
-InputChannel::~InputChannel(){
+void Channel::createBuffer( unsigned int dataSize ){
+	this->doubleBuf = new double[dataSize];
+	this->dataSize = dataSize;
+}
+
+bool Channel::isValid( int type ){
+	if( type == this->channelType )
+		return true;
+	return false;
+}
+
+Channel::~Channel(){
 
 }
 
 // Input state machine
 
-InputStateMachine::InputStateMachine():state(Data_Direction){
+InputStateMachine::InputStateMachine( Channel *c ):state(Data_Direction){
+	this->channel = c;
+}
 
+void InputStateMachine::reset(){
+	state = Data_Direction;
 }
 
 void InputStateMachine::processDataDirection( int new_socket ){
@@ -93,13 +115,13 @@ void InputStateMachine::processDataDirection( int new_socket ){
 
 	std::cout << "Handshake received: " << int(buffer[0]) << std::endl; 
 
-	if( buffer[0] == AM_SOURCE ){
-		std::cout << "Correct! we are the target" << std::endl;
+	if( channel->isValid(buffer[0]) ){
+		std::cout << "Correct type" << std::endl;
 		buffer[0] = RESP_HELLO;
 		send(new_socket, buffer, 1 , 0 ); 
 		state = Data_Type;
 	}else{
-		perror("Unexpected byte mode. This has to be a target.");
+		perror("Unexpected byte mode. E.g. using the ouput channel as an input.");
 	}
 }
 
@@ -126,7 +148,7 @@ void InputStateMachine::processDataType( int new_socket ){
 
 void InputStateMachine::processLength( int new_socket ){
 	int v;
-	dataSize = 0;
+	unsigned int dataSize = 0;
 	v = read( new_socket, buffer, 4); 
 
 	if( v != 4 ){
@@ -141,7 +163,7 @@ void InputStateMachine::processLength( int new_socket ){
 
 	std::cout << "Length received: " << dataSize << std::endl; 
 
-	doubleBuf = new double[dataSize];
+	channel->createBuffer( dataSize );
 
 	buffer[0] = RESP_RECVD;
 	send( new_socket, buffer, 1, 0);
@@ -170,29 +192,14 @@ void InputStateMachine::processName( int new_socket ){
 	std::cout << "name: " << buffer << std::endl;
 
 	buffer[0] = RESP_RECVD;
-	send( new_socket, buffer, 1, 0);
-	
+	send( new_socket, buffer, 1, 0);	
 	state = Read_Data;
-	elapsed = 0;
+	channel->elapsed = 0;
 }
 
-
 void InputStateMachine::processData( int new_socket ){
-	std::cout << "Processing data" << std::endl;
-	int v;
-
-	v = read( new_socket, doubleBuf, sizeof(double)*dataSize );
-
-	if( v == 0 )
-		elapsed++; 
-
-	if( elapsed > 10 )
-		state = Done;
-
-	std::cout << "Data received: " << doubleBuf[0] << std::endl;
-
-	buffer[0] = RESP_RECVD;
-	send( new_socket, buffer, 1, 0);
+	std::cout << "Processin data! " << std::endl;
+	state = channel->processData( new_socket );
 }
 
 InState InputStateMachine::process( int new_socket ){
@@ -217,6 +224,106 @@ InState InputStateMachine::process( int new_socket ){
 	return state;
 }
 
+// Input channel
+InputChannel::InputChannel( OutputChannel *o ):Channel( IN_PORT, "Input channel" ){
+	this->output = o;
+	this->channelType = AM_SOURCE;
+}
+
+InState InputChannel::processData( int new_socket ){
+	std::cout << "Processing data" << std::endl;
+	int v;
+
+	v = read( new_socket, doubleBuf, sizeof(double)*dataSize );
+
+	if( v == 0 )
+		elapsed++; 
+
+	if( elapsed > 10 )
+	{
+		std::cout << "Connection timed out. Done!" << std::endl;		
+		return Done;
+	}
+
+	std::cout << "Data received: " << doubleBuf[0] << std::endl;
+
+	mtx.lock();
+	output->notify( doubleBuf[0] );
+	mtx.unlock();
+	std::cout << "Sending response"<< std::endl;
+	// Error when connection closed?
+	char buffer[1] = {RESP_RECVD};
+	int r = send( new_socket, buffer, 1, MSG_NOSIGNAL);
+	std::cout << "Data send with code: " << r << std::endl;
+
+	return Read_Data;
+}
+
+// Output channel
+OutputChannel::OutputChannel():Channel( OUT_PORT, "Output channel" ){
+	this->channelType = AM_TARGET;
+	ack = true;
+	// data = {1, 2, 3};
+}
+
+InState OutputChannel::processData( int new_socket ){
+	std::cout << "Ready to send data" << std::endl;
+	int v;
+	char respBuf[16];
+
+	if( !ack )
+	{
+
+		v = read( new_socket, respBuf, 1 );
+
+		if( v > 0 ){
+			ack = true;
+			elapsed = 0;
+		}else
+			elapsed++;
+
+		if( int(respBuf[0]) < 0 ){
+			std::cout << "Simulation done: " << int(respBuf[0]) << std::endl;
+				return Done;
+		}else
+			std::cout << "Ack received: " << int(respBuf[0]) << std::endl;
+	}
+
+	double *buffer = new double[1];
+
+	mtx.lock();
+	if( this->data.empty() ){
+		if( ack )
+			buffer[0] = 0; // Pad with zers
+		else if( elapsed > 10 )
+			return Done;
+		else
+			return Read_Data;
+	}else{
+		buffer[0] = data.front();	
+		data.pop_front();
+	}	
+	mtx.unlock();
+
+	std::cout << "Sending data back to the other model: " << buffer[0] << std::endl;
+
+	int r = send( new_socket, buffer, sizeof(double), MSG_NOSIGNAL);
+
+	ack = false;
+
+	if( r < 0 )
+		return Done;
+	else	
+		return Read_Data;
+}
+
+void OutputChannel::notify( double d ){
+	std::cout << "Output notified with the datum: " << d << std::endl;
+
+	data.push_back( d );
+}
+
+
 
 // Middleware
 MammalbotMiddleware::MammalbotMiddleware(){
@@ -224,18 +331,21 @@ MammalbotMiddleware::MammalbotMiddleware(){
 }
 
 void MammalbotMiddleware::init(){
+	std::cout << "Starting output channel" << std::endl;
+	output = new OutputChannel();
+	std::thread outThread( &OutputChannel::start, output );
+
 	std::cout << "Starting input channel" << std::endl;
-	startInputChannel();
+	input = new InputChannel( output );
+	std::thread inThread( &InputChannel::start, input  );
+
+	inThread.join();
+	outThread.join();
+
 }
 
-int MammalbotMiddleware::startInputChannel(){
-	input = new InputChannel();
 
-	input->start();
-}
-
-int MammalbotMiddleware::startOutputChannel(){
-	// outputChannel = new OutputChannel();
-
-	// outputChannel.start();
+MammalbotMiddleware::~MammalbotMiddleware(){
+	delete input;
+	delete output;
 }

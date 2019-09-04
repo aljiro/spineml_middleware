@@ -8,7 +8,11 @@
 #include <netinet/in.h>
 #include <stdlib.h> 
 #include <unistd.h>
+#include <deque>
 
+#include <pthread.h>
+#include <thread>
+#include <mutex>
 
 #define IN_PORT 50091
 #define OUT_PORT 50092
@@ -24,6 +28,9 @@
 #define AM_TARGET           46
 #define NOT_SET             99
 
+using namespace std;
+
+static std::mutex mtx;
 
 enum InState{ Data_Direction, 
 	        Data_Type, 
@@ -32,16 +39,18 @@ enum InState{ Data_Direction,
 	    	Read_Data,
 	    	Done};
 
+class Channel;
+
 class InputStateMachine{
 private:
 	InState state;
 	char buffer[16];
-	unsigned int dataSize;
-	double *doubleBuf;
-	int elapsed;
+	Channel *channel;
+
 public:
-	InputStateMachine();
+	InputStateMachine( Channel* c );
 	InState process( int new_socket );
+	void reset();
 	void processDataDirection( int new_socket );
 	void processName( int new_socket );
 	void processDataType( int new_socket );
@@ -49,35 +58,61 @@ public:
 	void processData( int new_socket );
 };
 
-class InputChannel{
+class Channel{
 private:
-	int sockfd, new_socket;
+	int sockfd, new_socket, port;
 	struct sockaddr_in address;
     bool active; 
-    InputStateMachine stateMachine;
 
+    InputStateMachine stateMachine;
+protected:
+	char *name;
+	int channelType;
+	double *doubleBuf;
+    unsigned int dataSize;
 public:
-	InputChannel();
+	bool done;
+	int elapsed;
+
+	Channel( int port, char *name );
 	void start();
 	void init();
 	bool isActive();
-	~InputChannel();
+	bool isValid( int type );
+	void createBuffer( unsigned int dataSize );
+
+	virtual InState processData( int new_socket ) = 0;
+
+	~Channel();
 };
 
-class OutputChannel{
+class OutputChannel : public Channel{
+private:
+	deque<double> data;
+	bool ack;
+public:
+	OutputChannel();
+	void notify( double data );
+	InState processData( int new_socket );
+};
 
+
+class InputChannel : public Channel{
+private:
+	OutputChannel *output;
+public:
+	InputChannel( OutputChannel* output );
+	InState processData( int new_socket );
 };
 
 class MammalbotMiddleware{
 private:
 	InputChannel *input;
 	OutputChannel *output;
-
-	int startInputChannel();
-	int startOutputChannel();
 public:
 	MammalbotMiddleware();
 	void init();
+	~MammalbotMiddleware();
 };
 
 #endif
